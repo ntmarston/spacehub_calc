@@ -1,6 +1,9 @@
 import pandas as pd
 import numpy as np
 import numbers
+import time as time_module
+from io import StringIO
+from itertools import groupby
 from matplotlib import pyplot as plt
 from matplotlib.ticker import FormatStrFormatter
 import matplotlib.animation as animation
@@ -12,6 +15,7 @@ from astropy.units import Quantity, UnitTypeError
 from scipy.interpolate import PchipInterpolator
 import seaborn as sns
 import warnings
+from IPython.display import HTML, display, clear_output
 warnings.filterwarnings("ignore")
 
 class TwoBodyOrbit:
@@ -536,7 +540,52 @@ class TwoBodyOrbit:
         self.set_orbital_period()
         if not mute:
             print("Done")
-    
+
+    @classmethod
+    def from_dataframe(cls, df, i=0, j=1, mute=True):
+        """
+        Constructs a TwoBodyOrbit from an existing DataFrame, bypassing file I/O.
+        Intended for use with live-read data from load_spacehub_data_live().
+
+        @param df: Pandas DataFrame in SpaceHub format (with norm columns already added).
+        @param i: Index of the primary mass object (default 0).
+        @param j: Index of the secondary mass object (default 1).
+        @param mute: If True, suppresses print output (default True).
+        @return: TwoBodyOrbit instance with all orbital elements computed.
+        """
+        obj = cls.__new__(cls)
+        obj.data = df.dropna()
+        obj.i = i
+        obj.j = j
+        if not mute:
+            print("Determining timesteps...")
+        obj.set_npoints()
+        obj.set_time()
+        obj.years = np.asarray(obj.time) / (2 * np.pi)
+        if not mute:
+            print("Calculating orbital state vectors...")
+        obj.set_R_and_V()
+        obj.set_masses()
+        obj.set_h_vector()
+        obj.set_N_vector()
+        obj.set_ecc_vector()
+        if not mute:
+            print("Calculating scalar orbital elements...")
+        obj.set_sma()
+        obj.set_scalar_e()
+        obj.set_inclination()
+        obj.set_longitude_of_ascending_node()
+        obj.set_true_anomaly()
+        obj.set_argument_of_periapsis()
+        obj.set_eccentric_anomaly()
+        obj.set_time_of_pericenter_passage()
+        obj.set_points_per_orbit()
+        obj.set_c0()
+        obj.set_orbital_period()
+        if not mute:
+            print("Done")
+        return obj
+
     #===============
     #Output methods
     #===============
@@ -1592,6 +1641,84 @@ def load_spacehub_data(filename, dropna=True):
     return df
 
 
+def load_spacehub_data_live(filename, expected_columns=None):
+    """
+    Safely reads a SpaceHub CSV output file that may be actively written to
+    by a running simulation. Handles incomplete lines and partial timestep blocks.
+
+    Uses a plain file read (safe under POSIX while another process writes) and
+    filters out any partial data caused by reading mid-write.
+
+    @param filename: Path to the CSV file being written by a C++ simulation.
+    @param expected_columns: Number of columns expected per data line. If None,
+                             auto-detected from the header row.
+    @return: DataFrame with complete timestep data and added norm columns,
+             or None if the file is missing or has insufficient data.
+    """
+    try:
+        with open(filename, 'r') as f:
+            raw_text = f.read()
+    except FileNotFoundError:
+        return None
+
+    lines = raw_text.split('\n')
+    if len(lines) < 2:
+        return None
+
+    header = lines[0].strip()
+    if not header:
+        return None
+    header_cols = header.split(',')
+    n_expected = expected_columns or len(header_cols)
+
+    # Filter for complete, parseable data lines
+    valid_lines = []
+    for line in lines[1:]:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        fields = stripped.split(',')
+        if len(fields) != n_expected:
+            continue
+        try:
+            [float(field) for field in fields]
+            valid_lines.append(stripped)
+        except ValueError:
+            continue
+
+    if not valid_lines:
+        return None
+
+    # Group by time value (first field) to identify timestep blocks
+    def time_key(line):
+        return line.split(',')[0]
+
+    timestep_groups = []
+    for time_val, group_iter in groupby(valid_lines, key=time_key):
+        timestep_groups.append(list(group_iter))
+
+    if not timestep_groups:
+        return None
+
+    # The first timestep is always complete (written before integration starts)
+    n_particles = len(timestep_groups[0])
+
+    # Keep only complete timestep blocks
+    complete_lines = []
+    for group in timestep_groups:
+        if len(group) == n_particles:
+            complete_lines.extend(group)
+
+    if not complete_lines:
+        return None
+
+    csv_text = header + '\n' + '\n'.join(complete_lines)
+    df = pd.read_csv(StringIO(csv_text))
+    df = df.dropna()
+    add_norms(df)
+    return df
+
+
 #----Utility Functions----
 
 def ensure_unit(x, unit: u.Unit):
@@ -1646,3 +1773,177 @@ def interp_intercept(x, y, intercept=0, npoints=1e3, returnCurves=False):
         return point, x_fine, y_fine
     else:
         return point
+
+
+#-------------Live Monitoring Tools--------------
+
+class LiveSimulationMonitor:
+    """
+    Real-time orbital element monitor for active SpaceHub simulations.
+
+    Periodically re-reads the simulation output file, computes orbital elements,
+    and updates a live plot in a Jupyter notebook. Uses seaborn for styling.
+
+    Usage in a Jupyter notebook:
+        monitor = LiveSimulationMonitor('simulation_output.dat')
+        monitor.run(plots=('e', 'a'), refresh_rate=5)
+        # Press the Jupyter interrupt button (stop button) to halt monitoring.
+
+    @param filename: Path to the SpaceHub CSV output file being written.
+    @param i: Index of the primary mass object (default 0).
+    @param j: Index of the secondary mass object (default 1).
+    """
+
+    def __init__(self, filename, i=0, j=1):
+        self.filename = filename
+        self.i = i
+        self.j = j
+        self._last_npoints = 0
+
+    def run(self, plots=('e', 'a', 'i', 'R'), refresh_rate=10.0, xlim=None,
+            ylim=None, figsize=None, max_iterations=None, style='darkgrid'):
+        """
+        Starts the live monitoring loop. Blocks until interrupted (KeyboardInterrupt)
+        or max_iterations is reached.
+
+        @param plots: Tuple of orbital element keys to plot (1-4 elements).
+                      Valid keys: 'e', 'a', 'i', 'R', 'Omega', 'omega', 'f', 'E'
+                      (same keys as TwoBodyOrbit.PLOT_CONFIG).
+        @param refresh_rate: Seconds between data re-reads (default 10.0).
+        @param xlim: X-axis limits tuple, or None for auto-scale.
+        @param ylim: Controls y-axis scaling:
+                     - None (default): use preset limits from PLOT_CONFIG
+                     - False: auto-scale all plots
+                     - (min, max) tuple: apply same limits to all plots
+                     - List of tuples/None/False: per-plot limits
+        @param figsize: Figure size tuple, or None for defaults.
+        @param max_iterations: Maximum number of refresh cycles (None = infinite).
+        @param style: Seaborn style name (default 'darkgrid').
+        """
+        iteration = 0
+
+        try:
+            while True:
+                if max_iterations is not None and iteration >= max_iterations:
+                    print("Reached maximum iterations. Stopping monitor.")
+                    break
+
+                # Step 1: Safely read the file
+                df = load_spacehub_data_live(self.filename)
+
+                if df is None or len(df) < 2:
+                    clear_output(wait=True)
+                    print(f"[Refresh #{iteration}] Waiting for simulation data in '{self.filename}'...")
+                    time_module.sleep(refresh_rate)
+                    iteration += 1
+                    continue
+
+                # Step 2: Compute orbital elements
+                try:
+                    orb = TwoBodyOrbit.from_dataframe(df, i=self.i, j=self.j, mute=True)
+                except Exception as exc:
+                    clear_output(wait=True)
+                    print(f"[Refresh #{iteration}] Data read ({len(df)} rows) but orbital "
+                          f"element computation failed: {exc}")
+                    print("Will retry on next refresh...")
+                    time_module.sleep(refresh_rate)
+                    iteration += 1
+                    continue
+
+                # Step 3: Build the plot
+                clear_output(wait=True)
+
+                sns.set_style(style)
+                plot_list = list(plots)[:4]
+                n = len(plot_list)
+
+                default_sizes = {1: (8, 5), 2: (12, 5), 3: (12, 8), 4: (12, 8)}
+                fig_size = figsize or default_sizes.get(n, (12, 8))
+
+                # Normalize ylim (same logic as plot_keplerian_evolution)
+                if ylim is None:
+                    ylim_list = [None] * n
+                elif ylim is False:
+                    ylim_list = [False] * n
+                elif isinstance(ylim, list):
+                    ylim_list = ylim + [None] * (n - len(ylim))
+                else:
+                    ylim_list = [ylim] * n
+
+                # Create subplot grid
+                if n == 1:
+                    fig, ax = plt.subplots(1, 1, figsize=fig_size)
+                    axs = [ax]
+                elif n == 2:
+                    fig, axs = plt.subplots(1, 2, figsize=fig_size)
+                    axs = list(axs)
+                elif n == 3:
+                    fig = plt.figure(figsize=fig_size)
+                    axs = [
+                        fig.add_subplot(2, 2, 1),
+                        fig.add_subplot(2, 2, 2),
+                        fig.add_subplot(2, 1, 2),
+                    ]
+                else:
+                    fig, axes = plt.subplots(2, 2, figsize=fig_size)
+                    axs = list(axes.flatten())
+
+                # Plot each element using seaborn
+                for idx, (ax, key) in enumerate(zip(axs, plot_list)):
+                    cfg = TwoBodyOrbit.PLOT_CONFIG[key]
+                    data_arr = getattr(orb, cfg['data'])
+                    sns.lineplot(x=orb.time, y=data_arr, ax=ax)
+                    ax.set_title(cfg['title'])
+                    ax.set_ylabel(cfg['ylabel'])
+                    ax.set_xlabel(r'$t$ ($yr \cdot (2\pi)^{-1}$)')
+
+                    if xlim is not None:
+                        ax.set_xlim(xlim)
+
+                    plot_ylim = ylim_list[idx]
+                    if plot_ylim is None:
+                        if cfg['ylim']:
+                            ax.set_ylim(cfg['ylim'])
+                    elif plot_ylim is not False:
+                        ax.set_ylim(plot_ylim)
+
+                    if cfg.get('fmt'):
+                        ax.yaxis.set_major_formatter(FormatStrFormatter(cfg['fmt']))
+
+                # Add status info
+                current_time = orb.time[-1] if orb.time else 0
+                current_years = current_time / (2 * np.pi)
+                delta = orb.npoints - self._last_npoints
+                self._last_npoints = orb.npoints
+
+                fig.suptitle(
+                    f"Live Monitor | t = {current_years:.2f} yr | "
+                    f"{orb.npoints} timesteps | +{delta} since last refresh",
+                    fontsize=10, y=1.02
+                )
+                fig.tight_layout()
+                plt.show()
+
+                time_module.sleep(refresh_rate)
+                iteration += 1
+
+        except KeyboardInterrupt:
+            print("\nMonitoring stopped by user.")
+        finally:
+            plt.close('all')
+
+
+def monitor_simulation(filename, plots=('e', 'a', 'i', 'R'), refresh_rate=10.0,
+                       i=0, j=1, **kwargs):
+    """
+    Convenience function to start live monitoring of a running simulation.
+
+    @param filename: Path to the simulation output CSV file.
+    @param plots: Orbital element keys to display.
+    @param refresh_rate: Seconds between refreshes.
+    @param i: Primary particle index (default 0).
+    @param j: Secondary particle index (default 1).
+    @param kwargs: Additional keyword arguments passed to LiveSimulationMonitor.run().
+    """
+    monitor = LiveSimulationMonitor(filename, i=i, j=j)
+    monitor.run(plots=plots, refresh_rate=refresh_rate, **kwargs)
