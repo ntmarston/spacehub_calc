@@ -1,3 +1,5 @@
+__version__ = "0.1.0"
+
 import pandas as pd
 import numpy as np
 import numbers
@@ -318,17 +320,31 @@ class TwoBodyOrbit:
         """
         Computes the argument of periapsis (omega).
         The angle from the ascending node to periapsis, measured in the orbital plane.
-        Uses sign of e_z to determine quadrant.
+        Uses atan2 for numerical stability (avoids arccos singularity near 0/360 deg).
         Sets self.argument_of_periapsis_rad and self.argument_of_periapsis_deg as NumPy arrays.
         """
         nx, ny, nz = np.asarray(self.N_vec[0]), np.asarray(self.N_vec[1]), np.asarray(self.N_vec[2])
         ex, ey, ez = np.asarray(self.e_vec[0]), np.asarray(self.e_vec[1]), np.asarray(self.e_vec[2])
+        hx, hy, hz = np.asarray(self.hvec[0]), np.asarray(self.hvec[1]), np.asarray(self.hvec[2])
         N_mag = np.asarray(self.magN)
         e_scalar = np.asarray(self.eccentricity)
 
-        Ndote = nx*ex + ny*ey + nz*ez
-        cos_omega = Ndote / (N_mag * e_scalar)
-        omega = np.where(ez >= 0, np.arccos(cos_omega), 2*np.pi - np.arccos(cos_omega))
+        denom = N_mag * e_scalar
+
+        cos_omega = (nx*ex + ny*ey + nz*ez) / denom
+
+        # sin(omega) = (N x e) . h_hat / (|N| |e|)
+        cross_x = ny*ez - nz*ey
+        cross_y = nz*ex - nx*ez
+        cross_z = nx*ey - ny*ex
+        h_mag = np.sqrt(hx**2 + hy**2 + hz**2)
+        sin_omega = (cross_x*hx + cross_y*hy + cross_z*hz) / (denom * h_mag)
+
+        omega = np.arctan2(sin_omega, cos_omega)
+        omega = np.where(omega < 0, omega + 2*np.pi, omega)
+
+        # Unwrap to prevent discontinuities at 0/360 boundary
+        omega = np.unwrap(omega - np.pi) + np.pi
 
         self.argument_of_periapsis_rad = omega
         self.argument_of_periapsis_deg = np.rad2deg(omega)
@@ -729,7 +745,7 @@ class TwoBodyOrbit:
             ax.set_xlim(xlim)
             ax.set_title(cfg['title'])
             ax.set_ylabel(cfg['ylabel'])
-            ax.set_xlabel(r'$yr (2\pi)^{-1}$')
+            ax.set_xlabel(r'$2\pi\mathrm{yr}^{-1}$')
 
             # Determine ylim for this plot
             plot_ylim = ylim_list[idx]
@@ -770,7 +786,7 @@ class TwoBodyOrbit:
             ax.set_xlim(xlim)
             ax.set_title(cfg['title'])
             ax.set_ylabel(cfg['ylabel'])
-            ax.set_xlabel(r'$yr (2\pi)^{-1}$')
+            ax.set_xlabel(r'$2\pi\mathrm{yr}^{-1}$')
             if cfg['ylim']:
                 ax.set_ylim(cfg['ylim'])
             if cfg.get('fmt'):
@@ -833,17 +849,19 @@ class TwoBodyOrbit:
         return ani
 
 
-
-
-
-class NBodyVisualizer:
+class ParticleSystem:
     """
-    Visualizer for N-body SpaceHub simulation outputs.
+    Particle system for N-body SpaceHub simulation outputs.
 
     Loads and organizes particle data from SpaceHub CSV output for easy
-    access and visualization. Supports arbitrary numbers of particles.
+    access, orbital element computation, and visualization. Supports
+    arbitrary numbers of particles.
 
     @param filename: Path to the SpaceHub CSV output file.
+    @param calc_elements: If True, compute Keplerian orbital elements for all
+                          particles relative to ref_particle_id.
+    @param ref_particle_id: Particle ID of the reference body (e.g. central mass).
+                            Required when calc_elements=True.
 
     @attr n_particles: Number of particles in the simulation.
     @attr npoints: Number of timesteps in the simulation.
@@ -851,18 +869,26 @@ class NBodyVisualizer:
     @attr masses: NumPy array of particle masses indexed by particle ID.
     @attr positions: Dict mapping particle ID to dict with 'x', 'y', 'z' arrays.
     @attr velocities: Dict mapping particle ID to dict with 'x', 'y', 'z' arrays.
+    @attr orbital_elements: Dict mapping particle ID to dict of orbital element arrays
+                            (keys: 'a', 'e', 'inc', 'Omega', 'omega', 'f').
+                            Only populated when calc_elements=True.
     @attr data: Raw pandas DataFrame containing all simulation data.
     """
 
-    def __init__(self, filename):
+    def __init__(self, filename, calc_elements=False, ref_particle_id=None):
         """
-        Initializes an NBodyVisualizer from SpaceHub simulation output.
+        Initializes a ParticleSystem from SpaceHub simulation output.
 
         Loads the CSV file and organizes data by particle for easy access.
         Each particle's position and velocity components are stored as
-        NumPy arrays indexed by timestep.
+        NumPy arrays indexed by timestep. Optionally computes orbital
+        elements for all particles relative to a reference particle.
 
         @param filename: Path to the SpaceHub CSV output file.
+        @param calc_elements: If True, compute orbital elements for all
+                              non-reference particles.
+        @param ref_particle_id: Particle ID of the reference body. Required
+                                when calc_elements=True.
         """
         # Load raw data
         self.data = load_spacehub_data(filename)
@@ -906,6 +932,107 @@ class NBodyVisualizer:
             }
 
         print(f"Loaded {self.n_particles} particles with {self.npoints} timesteps")
+
+        # Orbital element computation
+        self.ref_particle_id = ref_particle_id
+        self.orbital_elements = {}
+
+        if calc_elements:
+            if ref_particle_id is None:
+                raise ValueError("ref_particle_id must be specified when calc_elements=True")
+            if ref_particle_id not in particle_ids:
+                raise ValueError(f"ref_particle_id={ref_particle_id} not found in particle IDs {particle_ids}")
+            self._compute_orbital_elements()
+
+    def _compute_orbital_elements(self):
+        """
+        Computes Keplerian orbital elements for all particles relative to
+        the reference particle, treating each as an independent two-body problem.
+
+        Populates self.orbital_elements[pid] with dict of numpy arrays:
+        'a' (semi-major axis), 'e' (eccentricity), 'inc' (inclination, rad),
+        'Omega' (longitude of ascending node, rad), 'omega' (argument of
+        periapsis, rad), 'f' (true anomaly, rad).
+        """
+        ref = self.ref_particle_id
+        m_ref = self.masses[ref]
+
+        for pid in self.positions:
+            if pid == ref:
+                continue
+
+            m_pid = self.masses[pid]
+            m_tot = m_ref + m_pid
+
+            # Relative state vectors (pid relative to ref)
+            dx = self.positions[pid]['x'] - self.positions[ref]['x']
+            dy = self.positions[pid]['y'] - self.positions[ref]['y']
+            dz = self.positions[pid]['z'] - self.positions[ref]['z']
+            dvx = self.velocities[pid]['x'] - self.velocities[ref]['x']
+            dvy = self.velocities[pid]['y'] - self.velocities[ref]['y']
+            dvz = self.velocities[pid]['z'] - self.velocities[ref]['z']
+
+            # Semi-major axis (vis-viva)
+            a = calc_sma(m_tot, dx, dy, dz, dvx, dvy, dvz)
+
+            # Eccentricity vector and scalar
+            ex, ey, ez = calc_ecc(m_tot, dx, dy, dz, dvx, dvy, dvz)
+            e_scalar = np.sqrt(ex**2 + ey**2 + ez**2)
+
+            # Angular momentum vector
+            hx, hy, hz = calc_h_vector([dx, dy, dz], [dvx, dvy, dvz])
+            h_mag = np.sqrt(hx**2 + hy**2 + hz**2)
+
+            # Inclination
+            inc = np.arccos(np.clip(hz / h_mag, -1, 1))
+
+            # Node vector N = k_hat x h = (-hy, hx, 0)
+            Nx = -hy
+            Ny = hx
+            N_mag = np.sqrt(Nx**2 + Ny**2)
+
+            # Near-zero inclination threshold
+            low_inc = inc < 1e-8
+
+            # Longitude of ascending node
+            Omega = np.where(low_inc, 0.0, np.arctan2(Nx, Ny))
+            Omega = np.where(Omega < 0, Omega + 2*np.pi, Omega)
+
+            # Argument of periapsis
+            # For non-degenerate case: use N and e vectors via atan2
+            # For near-zero inclination: use longitude of periapsis convention
+            cos_omega = np.where(
+                low_inc,
+                ex / e_scalar,
+                (Nx*ex + Ny*ey) / (N_mag * e_scalar)
+            )
+            # sin(omega) = (N x e) . h_hat / (|N| |e|)
+            cross_x = Ny*ez
+            cross_y = -Nx*ez
+            cross_z = Nx*ey - Ny*ex
+            sin_omega = np.where(
+                low_inc,
+                ey / e_scalar,
+                (cross_x*hx + cross_y*hy + cross_z*hz) / (N_mag * e_scalar * h_mag)
+            )
+            omega = np.arctan2(sin_omega, cos_omega)
+            omega = np.where(omega < 0, omega + 2*np.pi, omega)
+
+            # True anomaly from eccentricity vector
+            r_mag = np.sqrt(dx**2 + dy**2 + dz**2)
+            edotr = ex*dx + ey*dy + ez*dz
+            cosf = np.clip(edotr / (e_scalar * r_mag), -1, 1)
+            rdotv = dx*dvx + dy*dvy + dz*dvz
+            f = np.where(rdotv >= 0, np.arccos(cosf), 2*np.pi - np.arccos(cosf))
+
+            self.orbital_elements[pid] = {
+                'a': a,
+                'e': e_scalar,
+                'inc': inc,
+                'Omega': Omega,
+                'omega': omega,
+                'f': f,
+            }
 
     def get_position(self, particle_id, timestep=None, relative_to=None):
         """
@@ -980,23 +1107,27 @@ class NBodyVisualizer:
     DEFAULT_COLORS = ['blue', 'red', 'green', 'orange', 'purple', 'cyan', 'magenta', 'yellow']
 
     def animate_trajectories(self, fig, ax, reference_frame=0, start_index=0,
-                             tail_length=None, colors=None, sizes=None, *args, **kwargs):
+                             tail_length=None, colors=None, sizes=None,
+                             plot_orbitals=False, orbital_fade_length=None,
+                             orbital_n_points=200,
+                             *args, **kwargs):
         """
         Creates an animated 3D trajectory visualization for all particles.
 
         The animation shows particle positions evolving over time with trailing
-        trajectory lines. The reference frame can be centered on a particle
-        or fixed at a point in space.
+        trajectory lines or instantaneous Keplerian orbits. The reference frame
+        can be centered on a particle or fixed at a point in space.
 
         Use HTML(ani.to_jshtml()) to render in IPython Notebooks.
 
         Example usage:
             fig = plt.figure()
             ax = fig.add_subplot(projection='3d')
-            # Center on particle 0
-            ani = viz.animate_trajectories(fig, ax, reference_frame=0, frames=500, interval=20)
-            # Or center on a fixed point
-            ani = viz.animate_trajectories(fig, ax, reference_frame=(0, 0, 0), frames=500)
+            # Standard trail mode
+            ani = ps.animate_trajectories(fig, ax, reference_frame=0, frames=500, interval=20)
+            # Orbital mode (requires calc_elements=True in constructor)
+            ani = ps.animate_trajectories(fig, ax, reference_frame=0, plot_orbitals=True,
+                                          orbital_fade_length=10, frames=500)
             HTML(ani.to_jshtml())
 
         @param fig: Matplotlib figure object to write the animation to.
@@ -1007,8 +1138,15 @@ class NBodyVisualizer:
                                Default is 0 (center on particle 0).
         @param start_index: Starting frame index in the data (default 0).
         @param tail_length: Number of frames for trajectory tail. None shows full trail.
+                            Ignored for non-reference particles when plot_orbitals=True.
         @param colors: List of colors for each particle. Uses DEFAULT_COLORS if None.
         @param sizes: List of marker sizes for each particle. Defaults to 20 for all.
+        @param plot_orbitals: If True, plot instantaneous Keplerian orbits instead of
+                              trajectory tails for non-reference particles. Requires
+                              orbital elements to have been computed (calc_elements=True).
+        @param orbital_fade_length: Number of past orbital curves to show with fading
+                                    alpha. None or 1 shows only the current orbit.
+        @param orbital_n_points: Number of points to sample along each orbit curve.
         @param args: Additional positional arguments passed to FuncAnimation.
         @param kwargs: Additional keyword arguments passed to FuncAnimation.
                        Common options: frames (int), interval (int, ms between frames).
@@ -1016,6 +1154,16 @@ class NBodyVisualizer:
         """
         particle_ids = list(self.positions.keys())
         n = len(particle_ids)
+
+        # Validate orbital mode requirements
+        if plot_orbitals:
+            if not self.orbital_elements:
+                raise ValueError("plot_orbitals=True requires orbital elements. "
+                                 "Set calc_elements=True in the constructor.")
+            if isinstance(reference_frame, int) and reference_frame != self.ref_particle_id:
+                raise ValueError(f"reference_frame={reference_frame} does not match "
+                                 f"ref_particle_id={self.ref_particle_id}. "
+                                 "Orbital elements are computed relative to ref_particle_id.")
 
         # Set default colors and sizes
         if colors is None:
@@ -1049,6 +1197,20 @@ class NBodyVisualizer:
                     'z': pz - ref_z,
                 }
 
+        # Pre-set axes limits from full trajectory extents so motion is visible
+        all_x = np.concatenate([transformed_positions[pid]['x'] for pid in particle_ids])
+        all_y = np.concatenate([transformed_positions[pid]['y'] for pid in particle_ids])
+        all_z = np.concatenate([transformed_positions[pid]['z'] for pid in particle_ids])
+
+        def _padded(arr, pad=0.1):
+            lo, hi = float(arr.min()), float(arr.max())
+            margin = (hi - lo) * pad if hi != lo else abs(hi) * pad or 1e-6
+            return lo - margin, hi + margin
+
+        ax.set_xlim(*_padded(all_x))
+        ax.set_ylim(*_padded(all_y))
+        ax.set_zlim(*_padded(all_z))
+
         # Store scatter and line artists for each particle
         scatters = []
         trails = []
@@ -1060,27 +1222,41 @@ class NBodyVisualizer:
             scatter = ax.scatter3D(pos['x'][0], pos['y'][0], pos['z'][0],
                                    c=colors[i], s=sizes[i], label=f'Particle {pid}')
             scatters.append(scatter)
-            # Initial trail line
+            # Initial trail line (used in non-orbital mode, or for reference particle)
             trail = ax.plot(pos['x'][0:1], pos['y'][0:1], pos['z'][0:1],
                            c=colors[i], alpha=0.5)[0]
             trails.append(trail)
+
+        # Set up orbital curve artists (ring buffer per non-reference particle)
+        orbit_lines = {}
+        orbit_cursor = {}
+        fade_len = max(1, orbital_fade_length or 1)
+
+        if plot_orbitals:
+            for i_p, pid in enumerate(particle_ids):
+                if isinstance(reference_frame, int) and pid == reference_frame:
+                    continue
+                if pid not in self.orbital_elements:
+                    continue
+                lines = []
+                color_idx = particle_ids.index(pid)
+                for _ in range(fade_len):
+                    line, = ax.plot([], [], [], c=colors[color_idx], alpha=0)
+                    lines.append(line)
+                orbit_lines[pid] = lines
+                orbit_cursor[pid] = 0
 
         ax.legend()
 
         # Store references for update function
         positions_ref = transformed_positions
         pids_ref = particle_ids
+        orbital_elems = self.orbital_elements
 
         def update(frame_num):
             artists = []
             for i, pid in enumerate(pids_ref):
                 pos = positions_ref[pid]
-
-                # Determine trail start index
-                if tail_length is not None:
-                    trail_start = max(0, frame_num - tail_length)
-                else:
-                    trail_start = 0
 
                 # Update scatter position
                 scatters[i]._offsets3d = (
@@ -1088,13 +1264,55 @@ class NBodyVisualizer:
                     [pos['y'][frame_num]],
                     [pos['z'][frame_num]]
                 )
+                artists.append(scatters[i])
 
-                # Update trail
-                trails[i].set_data(pos['x'][trail_start:frame_num+1],
-                                   pos['y'][trail_start:frame_num+1])
-                trails[i].set_3d_properties(pos['z'][trail_start:frame_num+1])
+                # Orbital mode: plot Keplerian orbit for non-reference particles
+                if plot_orbitals and pid in orbit_lines:
+                    actual_frame = start_index + frame_num
+                    elems = orbital_elems[pid]
 
-                artists.extend([scatters[i], trails[i]])
+                    a_t = elems['a'][actual_frame]
+                    e_t = elems['e'][actual_frame]
+                    inc_t = elems['inc'][actual_frame]
+                    Omega_t = elems['Omega'][actual_frame]
+                    omega_t = elems['omega'][actual_frame]
+
+                    # Generate orbit curve centered on reference (origin)
+                    ox, oy, oz = keplerian_orbit_points(
+                        a_t, e_t, inc_t, Omega_t, omega_t, orbital_n_points
+                    )
+
+                    # Write to ring buffer slot
+                    cursor = orbit_cursor[pid]
+                    orbit_lines[pid][cursor].set_data(ox, oy)
+                    orbit_lines[pid][cursor].set_3d_properties(oz)
+                    orbit_lines[pid][cursor].set_alpha(1.0)
+                    orbit_cursor[pid] = (cursor + 1) % fade_len
+
+                    # Update alphas for fading effect
+                    new_cursor = orbit_cursor[pid]
+                    for age in range(fade_len):
+                        idx = (new_cursor - 1 - age) % fade_len
+                        alpha = max(0, 1.0 - age / fade_len) if fade_len > 1 else 1.0
+                        orbit_lines[pid][idx].set_alpha(alpha)
+
+                    # Hide the trail line for orbital-mode particles
+                    trails[i].set_data([], [])
+                    trails[i].set_3d_properties([])
+
+                    artists.extend(orbit_lines[pid])
+                else:
+                    # Standard tail mode
+                    if tail_length is not None:
+                        trail_start = max(0, frame_num - tail_length)
+                    else:
+                        trail_start = 0
+
+                    trails[i].set_data(pos['x'][trail_start:frame_num+1],
+                                       pos['y'][trail_start:frame_num+1])
+                    trails[i].set_3d_properties(pos['z'][trail_start:frame_num+1])
+
+                artists.append(trails[i])
 
             return artists
 
@@ -1238,6 +1456,10 @@ class NBodyVisualizer:
 
         fig.tight_layout()
         return fig, axes
+
+
+# Backward-compatible alias
+NBodyVisualizer = ParticleSystem
 
 
 class Theorize:
@@ -1450,10 +1672,12 @@ def distance(data, key, i, j, npoints):
     else:
         print('wrong index type of j')
 
-    # Vectorized: use numpy array operations instead of loop
-    xdist = (xi.values - xj.values)[:npoints]
-    ydist = (yi.values - yj.values)[:npoints]
-    zdist = (zi.values - zj.values)[:npoints]
+    # Vectorized: pre-slice to npoints before subtracting so mismatched lengths
+    # (e.g. one particle's row missing at a mid-write file boundary) never cause
+    # a broadcast error — npoints = min(len_i, len_j) is already the safe minimum.
+    xdist = xi.values[:npoints] - xj.values[:npoints]
+    ydist = yi.values[:npoints] - yj.values[:npoints]
+    zdist = zi.values[:npoints] - zj.values[:npoints]
     return xdist, ydist, zdist
 
 
@@ -1527,6 +1751,53 @@ def mag(vec):
     """
     x, y, z = np.asarray(vec[0]), np.asarray(vec[1]), np.asarray(vec[2])
     return np.sqrt(x**2 + y**2 + z**2)
+
+
+def keplerian_orbit_points(a, e, inc, Omega, omega, n_points=200):
+    """
+    Generates 3D coordinates along a Keplerian orbit from orbital elements.
+
+    Computes points in the perifocal frame and rotates to the inertial frame
+    using standard Euler angle rotations.
+
+    @param a: Semi-major axis (negative for hyperbolic orbits).
+    @param e: Eccentricity (scalar, single timestep value).
+    @param inc: Inclination in radians.
+    @param Omega: Longitude of ascending node in radians.
+    @param omega: Argument of periapsis in radians.
+    @param n_points: Number of points to sample along the orbit.
+    @return: Tuple (x, y, z) arrays of shape (n_points,) in inertial frame,
+             centered on the central body.
+    """
+    if e < 1.0:
+        # Elliptical: full orbit
+        f = np.linspace(0, 2*np.pi, n_points)
+    else:
+        # Hyperbolic: truncate at asymptotes
+        f_max = np.arccos(-1.0 / e)
+        margin = 0.01  # avoid singularity at asymptote
+        f = np.linspace(-f_max + margin, f_max - margin, n_points)
+
+    # Semi-latus rectum (positive for both elliptic and hyperbolic)
+    p = a * (1 - e**2)
+    r = p / (1 + e * np.cos(f))
+
+    # Perifocal coordinates
+    x_pf = r * np.cos(f)
+    y_pf = r * np.sin(f)
+
+    # Rotation: perifocal to inertial frame
+    cos_O, sin_O = np.cos(Omega), np.sin(Omega)
+    cos_i, sin_i = np.cos(inc), np.sin(inc)
+    cos_w, sin_w = np.cos(omega), np.sin(omega)
+
+    x = (cos_O*cos_w - sin_O*sin_w*cos_i)*x_pf + (-cos_O*sin_w - sin_O*cos_w*cos_i)*y_pf
+    y = (sin_O*cos_w + cos_O*sin_w*cos_i)*x_pf + (-sin_O*sin_w + cos_O*cos_w*cos_i)*y_pf
+    z = (sin_w*sin_i)*x_pf + (cos_w*sin_i)*y_pf
+
+    return x, y, z
+
+
 #-----------Getter/Modifier functions----------
 #
 #------------Helpers/Intermediates---------------
