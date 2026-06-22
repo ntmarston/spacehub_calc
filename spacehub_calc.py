@@ -875,7 +875,7 @@ class ParticleSystem:
     @attr data: Raw pandas DataFrame containing all simulation data.
     """
 
-    def __init__(self, filename, calc_elements=False, ref_particle_id=None):
+    def __init__(self, filename, calc_elements=False, ref_particle_id=None, mute=False):
         """
         Initializes a ParticleSystem from SpaceHub simulation output.
 
@@ -889,6 +889,7 @@ class ParticleSystem:
                               non-reference particles.
         @param ref_particle_id: Particle ID of the reference body. Required
                                 when calc_elements=True.
+        @param mute: If True, suppresses print output during initialization (default False).
         """
         # Load raw data
         self.data = load_spacehub_data(filename)
@@ -931,7 +932,8 @@ class ParticleSystem:
                 'z': particle_data['vz'].values[:self.npoints],
             }
 
-        print(f"Loaded {self.n_particles} particles with {self.npoints} timesteps")
+        if not mute:
+            print(f"Loaded {self.n_particles} particles with {self.npoints} timesteps")
 
         # Orbital element computation
         self.ref_particle_id = ref_particle_id
